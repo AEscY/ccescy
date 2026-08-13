@@ -2,333 +2,170 @@ import os
 import time
 import json
 import urllib.request
-import urllib.error
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from datetime import datetime
+from flask import Flask
 from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
-# ======================== 配置区 ========================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-THRESHOLD_SCORE = int(os.environ.get("THRESHOLD_SCORE", "30"))
-SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "30"))
 PORT = int(os.environ.get("PORT", 10000))
 
 DATA_FILE = "/tmp/airdrop_data.json"
-
 app = Flask(__name__)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-# ======================== 状态变量 ========================
-system_state = {
+state = {
     "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "scan_count": 0,
     "last_scan": None,
-    "last_push": None,
-    "projects_found": 0,
-    "running": False,
+    "total_found": 0
 }
 
-known_projects = set()
-
-
-# ======================== 数据持久化 ========================
-def load_known_projects():
-    global known_projects
+def load_data():
     if os.path.exists(DATA_FILE):
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                known_projects = set(json.load(f))
-        except Exception:
-            known_projects = set()
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"known_ids": []}
 
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
 
-def save_known_projects():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(known_projects), f)
-
-
-# ======================== DefiLlama API ========================
-def fetch_defillama_protocols():
+def fetch_protocols():
     url = "https://api.llama.fi/protocols"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"API请求失败: {e}")
-        return []
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    response = urllib.request.urlopen(req, timeout=30)
+    return json.loads(response.read().decode())
 
-
-# ======================== 评分系统 ========================
-def score_protocol(protocol):
+def calc_score(p):
     score = 0
-    details = []
-
-    name = protocol.get("name", "Unknown")
-    tvl = protocol.get("tvl", 0)
-    chain = protocol.get("chain", "")
-    category = protocol.get("category", "")
-
-    is_tokenlisted = protocol.get("token") or protocol.get("tokenSymbol")
-    if is_tokenlisted:
-        return -1, "已有代币"
-
-    if tvl > 100_000_000:
+    tvl = p.get("tvl", 0)
+    if tvl > 10000000:
         score += 30
-        details.append(f"TVL超$1亿 (+30)")
-    elif tvl > 10_000_000:
+    elif tvl > 1000000:
         score += 20
-        details.append(f"TVL超$1000万 (+20)")
-    elif tvl > 1_000_000:
+    elif tvl > 100000:
         score += 10
-        details.append(f"TVL超$100万 (+10)")
-    elif tvl > 100_000:
-        score += 5
-        details.append(f"TVL超$10万 (+5)")
-
-    chains = protocol.get("chains", [])
+    chains = p.get("chains", [])
     if len(chains) >= 3:
-        score += 10
-        details.append(f"多链部署×{len(chains)} (+10)")
-    elif len(chains) >= 2:
-        score += 5
-        details.append(f"双链部署 (+5)")
-
-    if category in ["Dexs", "Lending", "Bridge", "Liquid Staking"]:
         score += 15
-        details.append(f"热门赛道 {category} (+15)")
-    elif category in ["Yield", "Derivatives", "NFT Marketplace"]:
-        score += 10
-        details.append(f"潜力赛道 {category} (+10)")
-
-   cmcId = protocol.get("cmcId", "")
-    if cmcId:
-        score += 10
-        details.append(f"已上CMC (cmcId:{cmcId}) (+10)")
-
-    cgId = protocol.get("gecko_id", "")
-    if cgId:
+    elif len(chains) >= 1:
         score += 5
-        details.append(f"已上CoinGecko (+5)")
-
-    mcap = protocol.get("mcap", 0)
-    if mcap and mcap > 100_000_000:
+    name = p.get("name", "")
+    category = p.get("category", "")
+    if "defi" in category.lower() or "dex" in category.lower():
+        score += 10
+    if tvl > 0 and len(chains) > 0:
         score += 5
-        details.append(f"市值超$1亿 (+5)")
+    return score
 
-    return score, details
+def build_message(p, score):
+    name = p.get("name", "Unknown")
+    tvl = p.get("tvl", 0)
+    chains = p.get("chains", [])
+    category = p.get("category", "Unknown")
+    chain_str = ", ".join(chains[:5]) if chains else "None"
+    tvl_str = f"${tvl:,.0f}" if tvl > 0 else "N/A"
+    msg = f"\ud83d\udea8 *新空投信号*\n\n"
+    msg += f"\ud83d\udccc 名称: {name}\n"
+    msg += f"\ud83d\udcca TVL: {tvl_str}\n"
+    msg += f"\ud83d\udd17 链: {chain_str}\n"
+    msg += f"\ud83c\udff7 分类: {category}\n"
+    msg += f"\u2b50 评分: {score}\n"
+    msg += f"\n\ud83d\udc49 建议立即交互锁定资格！"
+    return msg
 
-
-# ======================== 推送消息 ========================
-async def push_to_telegram(project_info):
-    if not TELEGRAM_CHAT_ID:
-        print("未配置CHAT_ID，跳过推送")
-        return
-
-    msg = (
-        "🚨 <b>新空投机会发现</b>\n\n"
-        f"📛 项目名称: {project_info['name']}\n"
-        f"🔗 链: {project_info['chain']}\n"
-        f"📂 赛道: {project_info['category']}\n"
-        f"💰 TVL: ${project_info['tvl_formatted']}\n"
-        f"⭐ 评分: <b>{project_info['score']}</b>\n\n"
-        f"📊 评分详情:\n"
-    )
-    for d in project_info["details"]:
-        msg += f"  • {d}\n"
-
-    msg += f"\n🔗 DefiLlama: {project_info['url']}"
-
+async def send_to_telegram(msg):
     try:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
-            parse_mode="HTML"
-        )
-        print(f"✅ 已推送: {project_info['name']}")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
     except Exception as e:
-        print(f"推送失败: {e}")
+        print(f"TG send error: {e}")
 
+async def cmd_start(update, context):
+    msg = "\ud83e\udd16 *Airdrop Bot 已启动*\n\n"
+    msg += "\u23f1 扫描间隔: 30分钟\n"
+    msg += f"\ud83c\udfaf 推送阈值: 评分\N{GREATER-THAN OR EQUAL TO}{THRESHOLD_SCORE}\n"
+    msg += f"\ud83d\udce1 已启动: {state['start_time']}\n"
+    msg += f"\ud83d\udd0d 扫描次数: {state['scan_count']}\n"
+    msg += f"\u2705 发现项目: {state['total_found']}"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ======================== 主扫描逻辑 ========================
+async def cmd_status(update, context):
+    msg = "\ud83d\udcca *系统状态*\n\n"
+    msg += f"\u23f1 运行时间: {state['start_time']}\n"
+    msg += f"\ud83d\udd0d 累计扫描: {state['scan_count']} 次\n"
+    msg += f"\ud83d\udce2 推送项目: {state['total_found']} 个\n"
+    last = state['last_scan'] or "尚未扫描"
+    msg += f"\u23f0 最后扫描: {last}"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cmd_scan(update, context):
+    await update.message.reply_text("\ud83d\udd0d 正在手动扫描，请稍候...")
+    await run_scan()
+    await update.message.reply_text("\u2705 手动扫描完成")
+
+async def cmd_help(update, context):
+    msg = "\ud83d\udcda *可用命令*\n\n"
+    msg += "/start - 启动信息\n"
+    msg += "/status - 查看系统状态\n"
+    msg += "/scan - 手动触发扫描\n"
+    msg += "/help - 显示此帮助"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 async def run_scan():
-    system_state["scan_count"] += 1
-    system_state["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 第 {system_state['scan_count']} 次扫描...")
-
-    protocols = fetch_defillama_protocols()
-    if not protocols:
-        print("未获取到数据")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始扫描...")
+    state['scan_count'] += 1
+    state['last_scan'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = load_data()
+    known = set(data.get("known_ids", []))
+    try:
+        protocols = fetch_protocols()
+    except Exception as e:
+        print(f"Fetch error: {e}")
         return
-
-    new_projects = []
-
+    new_count = 0
     for p in protocols:
         name = p.get("name", "")
-        if not name:
+        pid = p.get("id", "")
+        if not pid:
             continue
-
-        slug = p.get("slug", name)
-        if slug in known_projects:
+        token = p.get("token")
+        if token is not None:
             continue
-
-        score, details = score_protocol(p)
-
+        score = calc_score(p)
         if score >= THRESHOLD_SCORE:
-            tvl_val = p.get("tvl", 0)
-            if tvl_val >= 1_000_000_000:
-                tvl_fmt = f"{tvl_val/1_000_000_000:.2f}B"
-            elif tvl_val >= 1_000_000:
-                tvl_fmt = f"{tvl_val/1_000_000:.2f}M"
-            elif tvl_val >= 1_000:
-                tvl_fmt = f"{tvl_val/1_000:.0f}K"
-            else:
-                tvl_fmt = f"{tvl_val:.0f}"
+            if pid not in known:
+                known.add(pid)
+                msg = build_message(p, score)
+                await send_to_telegram(msg)
+                state['total_found'] += 1
+                new_count += 1
+                print(f"  \u27a4 新发现: {name} (评分{score})")
+    data["known_ids"] = list(known)
+    save_data(data)
+    print(f"  \u2192 本轮新增: {new_count}, 已知: {len(known)}")
 
-            project_info = {
-                "slug": slug,
-                "name": name,
-                "chain": p.get("chains", ["Unknown"])[0] if p.get("chains") else "Unknown",
-                "category": p.get("category", "Unknown"),
-                "tvl_formatted": tvl_fmt,
-                "score": score,
-                "details": details,
-                "url": f"https://defillama.com/protocol/{slug}",
-            }
-            new_projects.append(project_info)
-            known_projects.add(slug)
-
-    for proj in new_projects:
-        await push_to_telegram(proj)
-
-    if new_projects:
-        system_state["last_push"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        system_state["projects_found"] += len(new_projects)
-        save_known_projects()
-        print(f"✅ 发现 {len(new_projects)} 个新项目并已推送")
-    else:
-        print("未发现符合条件的新项目")
-
-
-# ======================== 定时任务 ========================
-async def scan_loop():
-    while True:
-        await run_scan()
-        await asyncio_sleep(SCAN_INTERVAL_MINUTES * 60)
-
-
-async def asyncio_sleep(seconds):
-    await __import__("asyncio").sleep(seconds)
-
-
-def start_background_scan():
+def scan_loop():
     import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    system_state["running"] = True
-    loop.run_until_complete(scan_loop())
+    while True:
+        try:
+            loop.run_until_complete(run_scan())
+        except Exception as e:
+            print(f"Scan error: {e}")
+        time.sleep(SCAN_INTERVAL_MINUTES * 60)
 
-
-# ======================== Telegram 命令 ========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 <b>Airdrop Bot 已上线</b>\n\n"
-        f"⏱ 每 <b>{SCAN_INTERVAL_MINUTES}</b> 分钟扫描一次\n"
-        f"🎯 评分 ≥ <b>{THRESHOLD_SCORE}</b> 自动推送\n"
-        f"📅 启动时间: {system_state['start_time']}\n\n"
-        "输入 /menu 查看可用命令"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "📋 <b>命令菜单</b>\n\n"
-        "/status - 查看系统运行状态\n"
-        "/scan - 手动触发一次扫描\n"
-        "/projects - 查看已收录项目数\n"
-        "/menu - 显示此菜单"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "📊 <b>系统状态</b>\n\n"
-        f"🟢 运行中: {'是' if system_state['running'] else '否'}\n"
-        f"📅 启动时间: {system_state['start_time']}\n"
-        f"🔄 已扫描: {system_state['scan_count']} 次\n"
-        f"🕐 上次扫描: {system_state['last_scan'] or '暂无'}\n"
-        f"📬 上次推送: {system_state['last_push'] or '暂无'}\n"
-        f"📦 已收录: {len(known_projects)} 个项目\n"
-        f"🎯 已推送: {system_state['projects_found']} 个项目\n"
-        f"⏱ 扫描间隔: {SCAN_INTERVAL_MINUTES} 分钟\n"
-        f"🎯 推送阈值: ≥{THRESHOLD_SCORE}分"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 正在扫描...", parse_mode="HTML")
-    await run_scan()
-    await update.message.reply_text("✅ 扫描完成", parse_mode="HTML")
-
-
-async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = f"📦 已收录项目总数: <b>{len(known_projects)}</b>"
-    if known_projects:
-        recent = list(known_projects)[-20:]
-        msg += f"\n\n最近收录:\n"
-        for slug in recent:
-            msg += f"  • {slug}\n"
-        if len(known_projects) > 20:
-            msg += f"\n... 还有 {len(known_projects) - 20} 个"
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-# ======================== Flask 路由 ========================
 @app.route("/")
 def index():
-    return jsonify({
-        "status": "alive",
-        "bot": "Airdrop Bot",
-        "start_time": system_state["start_time"],
-        "scan_count": system_state["scan_count"],
-        "last_scan": system_state["last_scan"],
-        "projects_tracked": len(known_projects),
-        "projects_pushed": system_state["projects_found"],
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "healthy"}), 200
-
-
-# ======================== 启动 ========================
-def main():
-    load_known_projects()
-    print(f"✅ 已加载 {len(known_projects)} 个已知项目")
-    print(f"✅ 扫描间隔: {SCAN_INTERVAL_MINUTES} 分钟")
-    print(f"✅ 推送阈值: ≥{THRESHOLD_SCORE} 分")
-
-    app_builder = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app_builder.add_handler(CommandHandler("start", cmd_start))
-    app_builder.add_handler(CommandHandler("menu", cmd_menu))
-    app_builder.add_handler(CommandHandler("status", cmd_status))
-    app_builder.add_handler(CommandHandler("scan", cmd_scan))
-    app_builder.add_handler(CommandHandler("projects", cmd_projects))
-    app_builder.run_polling(drop_pending_updates=True)
-
+    return jsonify({"status": "ok", "scans": state['scan_count'], "found": state['total_found']})
 
 if __name__ == "__main__":
     import threading
-    threading.Thread(target=start_background_scan, daemon=True).start()
-    main()
+    t = threading.Thread(target=scan_loop, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=PORT)
