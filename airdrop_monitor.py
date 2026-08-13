@@ -43,16 +43,20 @@ def score_project(p):
     return min(score, 100)
 
 def push(message):
-    """推送消息到 Telegram（通过 Cloudflare Worker）"""
-    print(f"📤 准备推送消息: {message[:50]}...")  # 调试输出
+    print(f"📤 准备推送消息: {message[:50]}...")
     if not PUSH_URL or not PUSH_SECRET:
         print("❌ 环境变量 PUSH_URL 或 PUSH_SECRET 未设置")
         return
     headers = {"Content-Type": "application/json", "X-Auth-Token": PUSH_SECRET}
     try:
         resp = requests.post(PUSH_URL, json={"message": message}, headers=headers, timeout=10)
+        print(f"🔍 响应状态码: {resp.status_code}")
+        print(f"🔍 响应内容: {resp.text[:200]}")
         if resp.status_code == 200:
-            print(f"✅ 推送成功: {resp.json()}")
+            try:
+                print(f"✅ 推送成功: {resp.json()}")
+            except ValueError:
+                print(f"✅ 推送成功（非JSON响应）: {resp.text}")
         else:
             print(f"⚠️ 推送失败，状态码 {resp.status_code}: {resp.text}")
     except Exception as e:
