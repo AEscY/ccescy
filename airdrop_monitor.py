@@ -1,26 +1,39 @@
 import os
-import requests
+import sys
 import json
+import re
+import requests
 from datetime import datetime, timedelta
-from openai import OpenAI
 
-# ---- 从环境变量读取 ----
+# ---------- 导入智谱 AI SDK ----------
+try:
+    from zhipuai import ZhipuAI
+    ZHIPU_AVAILABLE = True
+except ImportError:
+    ZHIPU_AVAILABLE = False
+    print("⚠️ 未安装 zhipuai，请运行: pip install zhipuai")
+
+# ---------- 从环境变量读取配置 ----------
 PUSH_URL = os.getenv("PUSH_URL")
 PUSH_SECRET = os.getenv("PUSH_SECRET")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 新增：DeepSeek API Key
-# -------------------------
+ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
+AI_MODEL = os.getenv("AI_MODEL", "glm-4-flash")  # 默认模型
 
-# ---- 初始化 DeepSeek 客户端 ----
-deepseek_client = None
-if DEEPSEEK_API_KEY:
-    deepseek_client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com"
-    )
-    print("✅ DeepSeek AI 已初始化")
+# ---------- 初始化智谱客户端 ----------
+zhipu_client = None
+if ZHIPU_AVAILABLE and ZHIPU_API_KEY:
+    try:
+        zhipu_client = ZhipuAI(api_key=ZHIPU_API_KEY)
+        print("✅ 智谱 AI (GLM-4-Flash) 已初始化")
+    except Exception as e:
+        print(f"❌ 智谱 AI 初始化失败: {e}")
 else:
-    print("⚠️ 未设置 DEEPSEEK_API_KEY，AI 筛选功能将禁用")
+    if not ZHIPU_AVAILABLE:
+        print("⚠️ 缺少 zhipuai 库，AI 评分禁用")
+    elif not ZHIPU_API_KEY:
+        print("⚠️ 未设置 ZHIPU_API_KEY，AI 评分禁用")
 
+# ---------- 数据获取 ----------
 def fetch_new_projects():
     """从 DeFiLlama 获取最近7天的新项目"""
     try:
@@ -33,6 +46,7 @@ def fetch_new_projects():
         print(f"❌ 获取项目失败: {e}")
         return []
 
+# ---------- 规则评分 ----------
 def score_project(p):
     """规则评分：TVL + 链数量 + 审计 + 开源"""
     score = 0
@@ -56,12 +70,10 @@ def score_project(p):
         score += 10
     return min(score, 100)
 
+# ---------- AI 评分 ----------
 def ai_score_project(project):
-    """
-    使用 DeepSeek AI 对项目进行评分（0-100分）
-    返回：评分整数，如果失败返回 None
-    """
-    if not deepseek_client:
+    """使用智谱 GLM-4-Flash 对项目评分 (0-100)"""
+    if not zhipu_client:
         return None
 
     name = project.get('name', '未知')
@@ -89,8 +101,8 @@ TVL：${tvl:,.0f}
 请只返回一个数字评分（0-100），不要有任何其他文字。"""
 
     try:
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-v4-flash",  # 使用 flash 版本，更快更便宜[reference:12]
+        response = zhipu_client.chat.completions.create(
+            model=AI_MODEL,
             messages=[
                 {"role": "system", "content": "你是一个专业的 Web3 空投分析师，只返回数字评分。"},
                 {"role": "user", "content": prompt}
@@ -100,18 +112,18 @@ TVL：${tvl:,.0f}
         )
         score_text = response.choices[0].message.content.strip()
         # 提取数字
-        import re
         numbers = re.findall(r'\d+', score_text)
         if numbers:
             score = int(numbers[0])
-            return min(100, max(0, score))  # 限制在 0-100 之间
+            return min(100, max(0, score))
         return None
     except Exception as e:
         print(f"⚠️ AI 评分失败 ({name}): {e}")
         return None
 
+# ---------- 推送函数 ----------
 def push(message):
-    """推送消息到 Telegram"""
+    """推送消息到 Telegram（通过 Cloudflare Worker）"""
     print(f"📤 准备推送消息: {message[:50]}...")
     if not PUSH_URL or not PUSH_SECRET:
         print("❌ 环境变量 PUSH_URL 或 PUSH_SECRET 未设置")
@@ -126,22 +138,25 @@ def push(message):
     except Exception as e:
         print(f"❌ 推送异常: {e}")
 
+# ---------- 格式化消息 ----------
 def format_project_message(projects):
-    """格式化项目推送消息"""
+    """格式化项目推送消息（含 AI 评分）"""
     lines = ["🚀 **空投情报**", f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
-    for p, s in projects[:5]:
+    for p, final_score in projects[:5]:
         name = p.get('name', 'Unknown')
         tvl = p.get('tvl', 0)
         chains = ', '.join(p.get('chains', [])[:3])
         url = p.get('url', '')
         ai_score = p.get('ai_score', 'N/A')
-        lines.append(f"**{name}** 评分: {s}/100 | AI: {ai_score}/100")
+        rule_score = p.get('rule_score', 'N/A')
+        lines.append(f"**{name}** 综合: {final_score}/100 | AI: {ai_score}/100 | 规则: {rule_score}/100")
         lines.append(f"  TVL: ${tvl:,.0f} | 链: {chains}")
         if url:
             lines.append(f"  🔗 {url}")
         lines.append("")
     return "\n".join(lines)
 
+# ---------- 主流程 ----------
 def main():
     print(f"🔄 开始扫描 {datetime.now()}")
 
@@ -160,25 +175,25 @@ def main():
         # 1. 规则评分
         rule_score = score_project(p)
 
-        # 2. AI 评分（如果启用）
+        # 2. AI 评分（仅当规则评分 >= 40 且 AI 可用）
         ai_score = None
-        if deepseek_client and rule_score >= 40:  # 只有规则评分及格才调用 AI，节省 token
+        if zhipu_client and rule_score >= 40:
             ai_score = ai_score_project(p)
             if ai_score is not None:
                 print(f"  🤖 {p.get('name')}: 规则={rule_score}, AI={ai_score}")
             else:
                 print(f"  ⚠️ {p.get('name')}: AI 评分失败，使用规则评分")
-                ai_score = rule_score  # AI 失败时回退到规则评分
+                ai_score = rule_score  # 回退
         else:
-            ai_score = rule_score  # AI 未启用时使用规则评分
+            ai_score = rule_score  # AI 未启用或规则分太低
 
-        # 3. 综合评分：规则评分和 AI 评分的平均值
+        # 3. 综合评分：规则和 AI 的平均值
         final_score = int((rule_score + ai_score) / 2) if ai_score is not None else rule_score
 
-        # 4. 判断是否推送（综合评分 >= 60）
+        # 4. 判断推送（综合分 >= 60）
         if final_score >= 60:
-            p['ai_score'] = ai_score
             p['rule_score'] = rule_score
+            p['ai_score'] = ai_score
             good.append((p, final_score))
 
     if not good:
@@ -189,11 +204,11 @@ def main():
         print("###GOOD_PROJECTS_END###")
         return
 
-    # 推送即时消息
+    # 即时推送
     push(format_project_message(good))
     print(f"✅ 完成，推送了 {len(good)} 个项目")
 
-    # 输出 JSON 供 main.py 收集（用于每日汇总）
+    # 输出 JSON 供 main.py 收集（每日汇总）
     print("###GOOD_PROJECTS_START###")
     out_data = [{
         "name": p[0].get('name', 'Unknown'),
