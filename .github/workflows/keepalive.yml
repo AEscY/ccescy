@@ -1,0 +1,21 @@
+name: Keep Render Alive + Trigger Scan
+
+on:
+  schedule:
+    # 每30分钟触发一次（UTC时间）
+    - cron: '*/30 * * * *'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Health Check
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.RENDER_URL }}/trigger")
+          echo "Render response: $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "⚠️ Render服务异常，HTTP状态码: $RESPONSE"
+            exit 1
+          fi
