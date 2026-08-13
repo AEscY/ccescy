@@ -17,7 +17,14 @@ except ImportError:
 PUSH_URL = os.getenv("PUSH_URL")
 PUSH_SECRET = os.getenv("PUSH_SECRET")
 ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
-AI_MODEL = os.getenv("AI_MODEL", "glm-4-flash")  # 默认模型
+AI_MODEL = os.getenv("AI_MODEL", "glm-4-flash")
+
+# ---------- 多链配置 ----------
+# 默认监控链：从环境变量读取，逗号分隔，默认 EVM 主流链
+MONITORED_CHAINS = os.getenv("MONITORED_CHAINS", "ethereum,arbitrum,base,solana,sui,optimism,polygon").split(",")
+# 清洗空格
+MONITORED_CHAINS = [c.strip() for c in MONITORED_CHAINS if c.strip()]
+print(f"📌 监控链列表: {MONITORED_CHAINS}")
 
 # ---------- 初始化智谱客户端 ----------
 zhipu_client = None
@@ -33,18 +40,37 @@ else:
     elif not ZHIPU_API_KEY:
         print("⚠️ 未设置 ZHIPU_API_KEY，AI 评分禁用")
 
-# ---------- 数据获取 ----------
-def fetch_new_projects():
-    """从 DeFiLlama 获取最近7天的新项目"""
+# ---------- 数据获取（多链） ----------
+def fetch_projects_by_chain(chain):
+    """从 DeFiLlama 获取指定链的新项目（最近7天）"""
     try:
-        resp = requests.get("https://api.llama.fi/protocols", timeout=15)
+        url = f"https://api.llama.fi/protocols?chain={chain}"
+        resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         week_ago = int((datetime.now() - timedelta(days=7)).timestamp())
-        return [p for p in data if p.get('listedAt', 0) > week_ago]
+        # 过滤最近7天新增的项目
+        new_projects = [p for p in data if p.get('listedAt', 0) > week_ago]
+        print(f"  🔗 {chain}: 发现 {len(new_projects)} 个新项目")
+        return new_projects
     except Exception as e:
-        print(f"❌ 获取项目失败: {e}")
+        print(f"❌ 获取链 {chain} 项目失败: {e}")
         return []
+
+def fetch_all_projects():
+    """汇总所有监控链的项目，并去重（按项目名称去重）"""
+    all_projects = []
+    seen_names = set()
+    for chain in MONITORED_CHAINS:
+        projects = fetch_projects_by_chain(chain)
+        for p in projects:
+            name = p.get('name', '')
+            if name and name not in seen_names:
+                seen_names.add(name)
+                # 合并链信息（如果已存在相同名称的项目，可能来自不同链，但 DeFiLlama 通常全局唯一）
+                all_projects.append(p)
+    print(f"📊 总去重后新项目数: {len(all_projects)}")
+    return all_projects
 
 # ---------- 规则评分 ----------
 def score_project(p):
@@ -111,7 +137,6 @@ TVL：${tvl:,.0f}
             max_tokens=10
         )
         score_text = response.choices[0].message.content.strip()
-        # 提取数字
         numbers = re.findall(r'\d+', score_text)
         if numbers:
             score = int(numbers[0])
@@ -123,7 +148,7 @@ TVL：${tvl:,.0f}
 
 # ---------- 推送函数 ----------
 def push(message):
-    """推送消息到 Telegram（通过 Cloudflare Worker）"""
+    """推送消息到 Telegram"""
     print(f"📤 准备推送消息: {message[:50]}...")
     if not PUSH_URL or not PUSH_SECRET:
         print("❌ 环境变量 PUSH_URL 或 PUSH_SECRET 未设置")
@@ -141,7 +166,7 @@ def push(message):
 # ---------- 格式化消息 ----------
 def format_project_message(projects):
     """格式化项目推送消息（含 AI 评分）"""
-    lines = ["🚀 **空投情报**", f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
+    lines = ["🚀 **空投情报（多链）**", f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
     for p, final_score in projects[:5]:
         name = p.get('name', 'Unknown')
         tvl = p.get('tvl', 0)
@@ -158,9 +183,10 @@ def format_project_message(projects):
 
 # ---------- 主流程 ----------
 def main():
-    print(f"🔄 开始扫描 {datetime.now()}")
+    print(f"🔄 开始多链扫描 {datetime.now()}")
 
-    projects = fetch_new_projects()
+    # 获取所有链的项目
+    projects = fetch_all_projects()
     if not projects:
         print("ℹ️ 未发现新项目")
         print("###GOOD_PROJECTS_START###")
@@ -168,14 +194,12 @@ def main():
         print("###GOOD_PROJECTS_END###")
         return
 
-    print(f"📊 发现 {len(projects)} 个新项目，开始评分...")
+    print(f"📊 共发现 {len(projects)} 个新项目，开始评分...")
 
     good = []
-    for p in projects[:30]:
-        # 1. 规则评分
+    for p in projects[:30]:  # 限制数量避免 API 过载
         rule_score = score_project(p)
 
-        # 2. AI 评分（仅当规则评分 >= 40 且 AI 可用）
         ai_score = None
         if zhipu_client and rule_score >= 40:
             ai_score = ai_score_project(p)
@@ -183,14 +207,12 @@ def main():
                 print(f"  🤖 {p.get('name')}: 规则={rule_score}, AI={ai_score}")
             else:
                 print(f"  ⚠️ {p.get('name')}: AI 评分失败，使用规则评分")
-                ai_score = rule_score  # 回退
+                ai_score = rule_score
         else:
-            ai_score = rule_score  # AI 未启用或规则分太低
+            ai_score = rule_score
 
-        # 3. 综合评分：规则和 AI 的平均值
         final_score = int((rule_score + ai_score) / 2) if ai_score is not None else rule_score
 
-        # 4. 判断推送（综合分 >= 60）
         if final_score >= 60:
             p['rule_score'] = rule_score
             p['ai_score'] = ai_score
@@ -198,17 +220,16 @@ def main():
 
     if not good:
         print("ℹ️ 没有高分项目")
-        push("📊 本次扫描完成，未发现高分项目")
+        push("📊 本次多链扫描完成，未发现高分项目")
         print("###GOOD_PROJECTS_START###")
         print(json.dumps([]))
         print("###GOOD_PROJECTS_END###")
         return
 
-    # 即时推送
     push(format_project_message(good))
     print(f"✅ 完成，推送了 {len(good)} 个项目")
 
-    # 输出 JSON 供 main.py 收集（每日汇总）
+    # 输出 JSON 供 main.py 收集每日汇总
     print("###GOOD_PROJECTS_START###")
     out_data = [{
         "name": p[0].get('name', 'Unknown'),
