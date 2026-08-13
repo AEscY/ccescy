@@ -15,481 +15,464 @@ THRESHOLD_SCORE = int(os.environ.get("THRESHOLD_SCORE", "30"))
 SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "30"))
 PORT = int(os.environ.get("PORT", 10000))
 
-# 数据存储文件（Render临时磁盘，每次重启会丢失，重启后重新扫描）
 DATA_FILE = "/tmp/airdrop_data.json"
 
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-# ======================== 状态变量 ========================
+# 全局状态
 system_state = {
-    "start_time": datetime.now().isoformat(),
-    "scan_count": 0,
-    "last_scan_time": None,
-    "last_push_count": 0,
-    "tracked_projects": {},  # protocol_id -> {info, score, pushed_at}
+    "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "total_scans": 0,
+    "total_pushes": 0,
+    "last_scan_time": "从未",
+    "last_scan_count": 0,
+    "is_scanning": False,
 }
 
-# ======================== 数据持久化 ========================
-def save_state():
+# 内存中的项目数据（Render重启后重新扫描）
+known_projects = {}
+scan_history = []
+
+
+def load_data():
+    global known_projects
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                known_projects = json.load(f)
+            print(f"[加载] 已恢复 {len(known_projects)} 个项目记录")
+        except:
+            known_projects = {}
+
+
+def save_data():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(system_state, f, ensure_ascii=False, indent=2)
+            json.dump(known_projects, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[保存状态失败] {e}")
+        print(f"[保存失败] {e}")
 
-def load_state():
-    global system_state
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                system_state.update(loaded)
-    except Exception as e:
-        print(f"[加载状态失败] {e}")
 
-# ======================== 数据抓取 ========================
 def fetch_defillama_protocols():
-    """抓取DefiLlama所有协议数据"""
+    """从 DefiLlama 获取所有无代币协议"""
     url = "https://api.llama.fi/protocols"
-    req = urllib.request.Request(url, headers={"User-Agent": "AirdropBot/1.0"})
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            return data
+            raw_data = json.loads(response.read().decode("utf-8"))
+            # 筛选无代币协议
+            tokenless = [p for p in raw_data if p.get("token") is None or str(p.get("token")).lower() == "false"]
+            return tokenless
     except Exception as e:
         print(f"[抓取失败] {e}")
         return []
 
-def fetch_defillama_tvl(protocol_slug):
-    """抓取单个协议的TVL历史数据"""
-    url = f"https://api.llama.fi/tvl/{protocol_slug}"
-    req = urllib.request.Request(url, headers={"User-Agent": "AirdropBot/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            return data  # list of [timestamp, tvl]
-    except Exception:
-        return []
 
 def calculate_score(protocol):
-    """对项目进行多维度评分"""
+    """计算项目空投评分"""
     score = 0
     details = []
 
-    # 1. TVL维度
-    tvl = protocol.get("tvl", 0)
-    if tvl > 100_000_000:
-        score += 25
-        details.append("TVL>$1亿 (+25)")
-    elif tvl > 50_000_000:
-        score += 20
-        details.append("TVL>$5000万 (+20)")
-    elif tvl > 10_000_000:
-        score += 15
-        details.append("TVL>$1000万 (+15)")
-    elif tvl > 1_000_000:
-        score += 10
-        details.append("TVL>$100万 (+10)")
-
-    # 2. 链上生态维度
+    name = protocol.get("name", "Unknown")
+    tvl = float(protocol.get("tvl", 0))
+    category = protocol.get("category", "")
     chains = protocol.get("chains", [])
+    change_1d = float(protocol.get("chainTvls", {}).get("all", {}).get("1d", 0)) if isinstance(protocol.get("chainTvls"), dict) else 0
+    change_7d = float(protocol.get("chainTvls", {}).get("all", {}).get("7d", 0)) if isinstance(protocol.get("chainTvls"), dict) else 0
+
+    # TVL 评分
+    if tvl > 1_000_000_000:
+        score += 30
+        details.append(f"TVL超$10亿 (+30)")
+    elif tvl > 100_000_000:
+        score += 20
+        details.append(f"TVL超$1亿 (+20)")
+    elif tvl > 10_000_000:
+        score += 10
+        details.append(f"TVL超$1000万 (+10)")
+    elif tvl > 1_000_000:
+        score += 5
+        details.append(f"TVL超$100万 (+5)")
+
+    # 链数量评分
     if len(chains) >= 5:
-        score += 15
-        details.append(f"多链部署({len(chains)}条) (+15)")
+        score += 10
+        details.append(f"多链部署 {len(chains)}条 (+10)")
     elif len(chains) >= 2:
-        score += 10
-        details.append(f"多链部署({len(chains)}条) (+10)")
+        score += 5
+        details.append(f"多链部署 {len(chains)}条 (+5)")
 
-    # 3. 分类维度（DeFi核心协议加分）
-    category = protocol.get("category", "").lower()
-    if category in ["dexes", "lending", "yield", "derivatives", "bridge"]:
+    # 分类加成
+    premium_categories = ["DEX", "Lending", "Bridge", "Liquid Staking", "Yield", "Options", "Derivatives"]
+    if category in premium_categories:
+        score += 10
+        details.append(f"热门赛道 {category} (+10)")
+
+    # 7天增长评分
+    if change_7d > 0.5:
         score += 15
-        details.append(f"核心DeFi赛道:{category} (+15)")
-    elif category in ["yield aggregator", "options", "insurance"]:
-        score += 10
-        details.append(f"DeFi赛道:{category} (+10)")
-
-    # 4. 名称/描述关键词（判断是否有代币）
-    name = protocol.get("name", "").lower()
-    description = str(protocol.get("description", "")).lower()
-    token_mentions = ["token", "governance", "airdrop", "$", "tokenomics"]
-    has_token_hint = any(kw in name or kw in description for kw in token_mentions)
-    if not has_token_hint:
-        score += 10
-        details.append("无明显代币信息 (+10)")
-
-    # 5. 社区/社交链接（有GitHub/Twitter说明项目活跃）
-    if protocol.get("twitter"):
-        score += 5
-        details.append("有Twitter (+5)")
-    if protocol.get("github"):
-        score += 5
-        details.append("有GitHub (+5)")
-    if protocol.get("url"):
-        score += 5
-        details.append("有官网 (+5)")
-
-    # 6. TVL趋势（最近7天增长加分）
-    slug = protocol.get("slug", "")
-    if slug:
-        tvl_history = fetch_defillama_tvl(slug)
-        if len(tvl_history) >= 14:
-            current_tvl = tvl_history[-1][1]
-            tvl_7d_ago = tvl_history[-7][1] if len(tvl_history) >= 7 else tvl_history[0][1]
-            if tvl_7d_ago > 0:
-                growth = (current_tvl - tvl_7d_ago) / tvl_7d_ago
-                if growth > 0.5:
-                    score += 20
-                    details.append(f"7天TVL增长{growth*100:.0f}% (+20)")
-                elif growth > 0.2:
-                    score += 10
-                    details.append(f"7天TVL增长{growth*100:.0f}% (+10)")
-                elif growth < -0.2:
-                    score -= 10
-                    details.append(f"7天TVL下降{abs(growth)*100:.0f}% (-10)")
+        details.append(f"7天TVL暴增 {change_7d*100:.0f}% (+15)")
+    elif change_7d > 0.2:
+        score += 8
+        details.append(f"7天TVL增长 {change_7d*100:.0f}% (+8)")
+    elif change_7d > 0.05:
+        score += 3
+        details.append(f"7天TVL增长 {change_7d*100:.0f}% (+3)")
 
     return score, details
 
-def format_project_message(protocol, score, details):
-    """格式化项目推送消息"""
-    name = protocol.get("name", "Unknown")
-    category = protocol.get("category", "Unknown")
-    tvl = protocol.get("tvl", 0)
-    chains = protocol.get("chains", [])
-    slug = protocol.get("slug", "")
 
-    tvl_str = f"${tvl/1_000_000_000:.2f}B" if tvl >= 1_000_000_000 else f"${tvl/1_000_000:.0f}M"
-    chains_str = ", ".join(chains[:5]) + (f" 等{len(chains)}条链" if len(chains) > 5 else "")
-    twitter = f"https://twitter.com/{protocol.get('twitter')}" if protocol.get("twitter") else "无"
-    website = protocol.get("url", "无")
-    defillama_link = f"https://defillama.com/protocol/{slug}" if slug else "无"
+async def send_telegram_message(text):
+    """发送消息到 Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Telegram] 未配置 Token 或 Chat ID，跳过推送")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            if result.get("ok"):
+                print(f"[Telegram] 消息发送成功")
+                return True
+            else:
+                print(f"[Telegram] 发送失败: {result}")
+                return False
+    except Exception as e:
+        print(f"[Telegram] 异常: {e}")
+        return False
+
+
+async def push_project(protocol, score, details):
+    """推送单个项目到 Telegram"""
+    name = protocol.get("name", "Unknown")
+    url = protocol.get("url", "")
+    tvl = float(protocol.get("tvl", 0))
+    category = protocol.get("category", "Unknown")
+    chains = protocol.get("chains", [])
+    description = protocol.get("description", "暂无描述")
+    twitter = protocol.get("twitter", "")
+    github = protocol.get("github", "")
+    audit_links = protocol.get("audit_links", [])
+    gecko_id = protocol.get("gecko_id", "")
+   cmcId = protocol.get("cmcId", "")
+
+    tvl_str = f"${tvl:,.0f}" if tvl >= 1 else f"${tvl:,.2f}"
+
+    links = []
+    if url:
+        links.append(f"🌐 官网: {url}")
+    if twitter:
+        links.append(f"🐦 Twitter: {twitter}")
+    if github:
+        links.append(f"💻 GitHub: {github}")
+    if gecko_id:
+        links.append(f"📊 CoinGecko: https://www.coingecko.com/en/coins/{gecko_id}")
+    if cmcId:
+        links.append(f"📊 CoinMarketCap: https://coinmarketcap.com/currencies/{cmcId}")
+    if audit_links:
+        links.append(f"🔒 审计: {audit_links[0]}")
+
+    links_str = "\n".join(links) if links else "暂无公开链接"
 
     detail_str = "\n".join([f"  • {d}" for d in details])
 
-    msg = (
-        f"🚨 <b>新空投信号发现</b>\n\n"
-        f"📌 <b>项目名称</b>：{name}\n"
-        f"🏷️ <b>赛道分类</b>：{category}\n"
-        f"💰 <b>TVL</b>：{tvl_str}\n"
-        f"⛓️ <b>部署链</b>：{chains_str}\n"
-        f"⭐ <b>综合评分</b>：<b>{score}</b> 分\n\n"
-        f"📊 <b>评分明细</b>：\n{detail_str}\n\n"
-        f"🔗 <b>相关链接</b>：\n"
-        f"  • 官网：{website}\n"
-        f"  • Twitter：{twitter}\n"
-        f"  • DefiLlama：{defillama_link}"
-    )
-    return msg
+    text = f"""🎯 <b>新空投机会发现</b>
 
-# ======================== 核心扫描逻辑 ========================
-async def run_scan():
+<b>项目名称:</b> {name}
+<b>赛道分类:</b> {category}
+<b>TVL:</b> {tvl_str}
+<b>部署链:</b> {", ".join(chains[:5])}{"..." if len(chains) > 5 else ""}
+<b>空投评分:</b> ⭐ {score} 分
+
+<b>评分明细:</b>
+{detail_str}
+
+<b>项目描述:</b>
+{description[:200]}{"..." if len(description) > 200 else ""}
+
+<b>相关链接:</b>
+{links_str}
+
+⏰ 发现时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}"""
+
+    success = await send_telegram_message(text)
+    if success:
+        system_state["total_pushes"] += 1
+    return success
+
+
+async def do_scan():
     """执行一次完整扫描"""
-    system_state["scan_count"] += 1
-    system_state["last_scan_time"] = datetime.now().isoformat()
-    save_state()
+    if system_state["is_scanning"]:
+        print("[扫描] 上次扫描未完成，跳过")
+        return
+
+    system_state["is_scanning"] = True
+    system_state["total_scans"] += 1
+
+    print(f"\n{'='*60}")
+    print(f"[扫描开始] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
 
     protocols = fetch_defillama_protocols()
     if not protocols:
+        print("[扫描] 未获取到数据")
+        system_state["is_scanning"] = False
+        system_state["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return
 
-    tracked = system_state.get("tracked_projects", {})
-    pushed_count = 0
+    new_pushed = 0
+    updated_pushed = 0
+    scan_results = []
 
-    for proto in protocols:
-        pid = proto.get("id")
-        if not pid:
-            continue
+    for protocol in protocols:
+        name = protocol.get("name", "Unknown")
+        url = protocol.get("url", "")
+        key = f"{name}_{url}"
 
-        # 只处理无代币协议（DefiLlama上tvl>0且无明确代币标识）
-        if proto.get("tvl", 0) == 0:
-            continue
-
-        score, details = calculate_score(proto)
+        score, details = calculate_score(protocol)
 
         if score >= THRESHOLD_SCORE:
-            if pid not in tracked:
-                # 新项目，推送
-                msg = format_project_message(proto, score, details)
-                try:
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=msg,
-                        parse_mode="HTML"
-                    )
-                    tracked[pid] = {
-                        "name": proto.get("name"),
-                        "score": score,
-                        "pushed_at": datetime.now().isoformat(),
-                        "tvl": proto.get("tvl"),
-                    }
-                    pushed_count += 1
-                except Exception as e:
-                    print(f"[推送失败] {proto.get('name')}: {e}")
+            # 判断是否为新项目
+            if key not in known_projects:
+                # 新项目
+                known_projects[key] = {
+                    "name": name,
+                    "url": url,
+                    "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_score": score,
+                    "pushed": False
+                }
+                scan_results.append((protocol, score, details, "new"))
             else:
-                # 已推送过的项目，检查分数变化
-                old_score = tracked[pid].get("score", 0)
-                if score > old_score + 10:
-                    # 分数显著提升，重新推送
-                    msg = (
-                        f"📈 <b>项目评分显著提升</b>\n\n"
-                        f"📌 {proto.get('name')} 评分 {old_score}→<b>{score}</b>\n"
-                        f"💰 TVL: ${proto.get('tvl',0)/1_000_000:.0f}M\n"
-                        f"📊 变化：{'、'.join(details[:3])}"
-                    )
-                    try:
-                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML")
-                        tracked[pid]["score"] = score
-                        tracked[pid]["pushed_at"] = datetime.now().isoformat()
-                        pushed_count += 1
-                    except Exception as e:
-                        print(f"[推送失败] {e}")
-                tracked[pid]["score"] = score
+                # 已记录项目，检查评分是否有显著变化
+                old_score = known_projects[key].get("last_score", 0)
+                if score >= old_score + 10 or score >= old_score + 5:
+                    scan_results.append((protocol, score, details, "updated"))
+                known_projects[key]["last_score"] = score
+                known_projects[key]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    system_state["tracked_projects"] = tracked
-    system_state["last_push_count"] = pushed_count
-    save_state()
+    # 先推送更新的项目
+    for protocol, score, details, status in scan_results:
+        if status == "updated":
+            await push_project(protocol, score, details)
+            updated_pushed += 1
 
-    if pushed_count > 0:
-        print(f"[扫描完成] 推送了 {pushed_count} 个项目")
-    else:
-        print(f"[扫描完成] 无新项目，已追踪 {len(tracked)} 个项目")
+    # 再推送新项目（新项目更重要）
+    for protocol, score, details, status in scan_results:
+        if status == "new":
+            await push_project(protocol, score, details)
+            known_projects[f"{protocol.get('name', '')}_{protocol.get('url', '')}"]["pushed"] = True
+            new_pushed += 1
 
-# ======================== 定时任务 ========================
-import asyncio
+    save_data()
 
-def start_background_scheduler():
-    """启动后台定时扫描任务"""
-    async def scheduler_loop():
-        while True:
-            try:
-                await run_scan()
-            except Exception as e:
-                print(f"[定时任务异常] {e}")
-            await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+    system_state["last_scan_count"] = len(protocols)
+    system_state["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    system_state["is_scanning"] = False
 
-    asyncio.create_task(scheduler_loop())
+    print(f"[扫描完成] 扫描 {len(protocols)} 个项目, 推送新项目 {new_pushed} 个, 更新项目 {updated_pushed} 个")
+    print(f"{'='*60}\n")
+
+
+async def scan_loop():
+    """后台定时扫描任务"""
+    while True:
+        try:
+            await do_scan()
+        except Exception as e:
+            print(f"[扫描异常] {e}")
+            system_state["is_scanning"] = False
+        await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+
 
 # ======================== Telegram 命令 ========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 <b>Airdrop Bot 已就绪</b>\n\n"
-        "欢迎使用私有空投情报系统。\n"
-        "当前配置：\n"
-        f"• 扫描频率：每 {SCAN_INTERVAL_MINUTES} 分钟\n"
-        f"• 推送阈值：评分 ≥ {THRESHOLD_SCORE}\n\n"
-        "输入 /menu 查看可用命令"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    """启动命令"""
+    text = f"""🤖 <b>Airdrop Bot 已上线</b>
+
+⏰ 每 {SCAN_INTERVAL_MINUTES} 分钟扫描一次
+🎯 评分≥{THRESHOLD_SCORE} 自动推送
+📊 数据源: DefiLlama 无代币协议
+
+可用命令：
+/menu - 显示主菜单
+/status - 查看系统运行状态
+/scan - 手动触发一次扫描
+/clear - 清除历史记录重新开始
+/help - 查看帮助"""
+    await update.message.reply_text(text, parse_mode="HTML")
+
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "📋 <b>命令菜单</b>\n\n"
-        "/start — 欢迎信息\n"
-        "/status — 系统运行状态\n"
-        "/scan — 手动触发一次扫描\n"
-        "/projects — 查看已追踪的项目\n"
-        "/threshold — 查看/修改推送阈值\n"
-        "/help — 帮助说明"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    """主菜单"""
+    text = f"""📋 <b>系统菜单</b>
+
+当前配置：
+• 扫描间隔: {SCAN_INTERVAL_MINUTES} 分钟
+• 推送阈值: {THRESHOLD_SCORE} 分
+• 已记录项目: {len(known_projects)} 个
+
+可用命令：
+• /status - 系统状态
+• /scan - 手动扫描
+• /clear - 清除历史
+• /help - 帮助信息"""
+    await update.message.reply_text(text, parse_mode="HTML")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_time = datetime.fromisoformat(system_state["start_time"])
-    uptime = datetime.now() - start_time
-    hours = int(uptime.total_seconds() // 3600)
-    mins = int((uptime.total_seconds() % 3600) // 60)
+    """系统状态"""
+    uptime = ""
+    try:
+        start = datetime.strptime(system_state["start_time"], "%Y-%m-%d %H:%M:%S")
+        delta = datetime.now() - start
+        hours = int(delta.total_seconds() // 3600)
+        mins = int((delta.total_seconds() % 3600) // 60)
+        uptime = f"{hours}小时{mins}分钟"
+    except:
+        uptime = "未知"
 
-    last_scan = system_state.get("last_scan_time")
-    if last_scan:
-        last_scan_str = datetime.fromisoformat(last_scan).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        last_scan_str = "尚未执行"
+    text = f"""📊 <b>系统运行状态</b>
 
-    msg = (
-        "📊 <b>系统状态</b>\n\n"
-        f"⏱ 运行时长：{hours}小时{mins}分钟\n"
-        f"🔄 扫描次数：{system_state['scan_count']} 次\n"
-        f"🕐 上次扫描：{last_scan_str}\n"
-        f"📦 追踪项目：{len(system_state.get('tracked_projects', {}))} 个\n"
-        f"📨 上次推送：{system_state.get('last_push_count', 0)} 条\n"
-        f"⚙️ 扫描间隔：{SCAN_INTERVAL_MINUTES} 分钟\n"
-        f"🎯 推送阈值：≥{THRESHOLD_SCORE} 分"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+🕐 启动时间: {system_state["start_time"]}
+⏱️ 运行时长: {uptime}
+🔄 累计扫描: {system_state["total_scans"]} 次
+📤 累计推送: {system_state["total_pushes"]} 条
+📋 记录项目: {len(known_projects)} 个
+⏳ 上次扫描: {system_state["last_scan_time"]}
+📦 上次扫描量: {system_state["last_scan_count"]} 个项目
+🎯 评分阈值: ≥{THRESHOLD_SCORE} 分
+⏰ 扫描间隔: {SCAN_INTERVAL_MINUTES} 分钟"""
+    await update.message.reply_text(text, parse_mode="HTML")
+
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 正在手动触发扫描，请稍候...")
-    try:
-        await run_scan()
-        pushed = system_state.get("last_push_count", 0)
-        tracked = len(system_state.get("tracked_projects", {}))
-        await update.message.reply_text(
-            f"✅ 扫描完成\n"
-            f"• 本次推送：{pushed} 条\n"
-            f"• 已追踪项目：{tracked} 个",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ 扫描失败：{str(e)}")
+    """手动扫描"""
+    await update.message.reply_text("🔄 正在手动扫描，请稍候...", parse_mode="HTML")
+    await do_scan()
+    await update.message.reply_text("✅ 扫描完成！", parse_mode="HTML")
 
-async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tracked = system_state.get("tracked_projects", {})
-    if not tracked:
-        await update.message.reply_text("📭 暂无已追踪的项目，等待扫描中...")
-        return
 
-    # 按pushed_at排序，最新的在前
-    sorted_projects = sorted(
-        tracked.items(),
-        key=lambda x: x[1].get("pushed_at", ""),
-        reverse=True
-    )
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """清除历史记录"""
+    global known_projects
+    known_projects = {}
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    system_state["total_pushes"] = 0
+    system_state["total_scans"] = 0
+    await update.message.reply_text("🗑️ 已清除所有历史记录，下次扫描将重新推送所有符合条件的项目。", parse_mode="HTML")
 
-    lines = []
-    for i, (pid, info) in enumerate(sorted_projects[:20], 1):
-        pushed_at = info.get("pushed_at", "")
-        if pushed_at:
-            pushed_str = datetime.fromisoformat(pushed_at).strftime("%m-%d %H:%M")
-        else:
-            pushed_str = "未知"
-        tvl_m = info.get("tvl", 0) / 1_000_000
-        lines.append(
-            f"{i}. <b>{info.get('name', 'Unknown')}</b> "
-            f"| 评分{info.get('score', '?')} "
-            f"| TVL${tvl_m:.0f}M "
-            f"| {pushed_str}"
-        )
-
-    total = len(sorted_projects)
-    showing = min(total, 20)
-    msg = (
-        f"📦 <b>已追踪项目</b>（共{total}个，显示最新{showing}个）\n\n"
-        + "\n".join(lines)
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if args:
-        try:
-            new_threshold = int(args[0])
-            global THRESHOLD_SCORE
-            THRESHOLD_SCORE = new_threshold
-            os.environ["THRESHOLD_SCORE"] = str(new_threshold)
-            save_state()
-            msg = f"✅ 推送阈值已更新为 ≥ <b>{new_threshold}</b> 分"
-        except ValueError:
-            msg = "❌ 请输入有效的数字，例如：/threshold 30"
-    else:
-        msg = f"🎯 当前推送阈值：≥ <b>{THRESHOLD_SCORE}</b> 分\n\n修改方法：<code>/threshold 新数值</code>"
-    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "💡 <b>帮助说明</b>\n\n"
-        "本Bot自动监控DefiLlama上的无代币DeFi协议，\n"
-        "从TVL、多链部署、赛道类型、TVL增速等维度评分，\n"
-        "达到阈值后自动推送到此对话。\n\n"
-        "<b>可用命令</b>：\n"
-        "/menu — 命令菜单\n"
-        "/status — 查看系统状态\n"
-        "/scan — 手动扫描\n"
-        "/projects — 已追踪项目\n"
-        "/threshold [数值] — 调整推送阈值\n"
-        "/help — 帮助"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    """帮助信息"""
+    text = """📖 <b>帮助文档</b>
+
+本 Bot 自动监控 DefiLlama 上的无代币 DeFi 协议，
+对每个项目进行多维度评分，达到阈值自动推送。
+
+评分维度：
+• TVL 规模（最高+30分）
+• 多链部署（最高+10分）
+• 热门赛道（+10分）
+• TVL增速（最高+15分）
+
+命令列表：
+• /start - 欢迎信息
+• /menu - 主菜单
+• /status - 系统状态
+• /scan - 手动扫描
+• /clear - 清除历史
+• /help - 此帮助"""
+    await update.message.reply_text(text, parse_mode="HTML")
+
 
 # ======================== Flask 路由 ========================
 @app.route("/")
-def health_check():
-    tracked_count = len(system_state.get("tracked_projects", {}))
+def index():
     return jsonify({
         "status": "alive",
         "service": "Airdrop Bot",
-        "uptime_hours": (datetime.now() - datetime.fromisoformat(system_state["start_time"])).total_seconds() / 3600,
-        "scan_count": system_state["scan_count"],
-        "tracked_projects": tracked_count,
-        "threshold": THRESHOLD_SCORE,
-        "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
-    })
+        "start_time": system_state["start_time"],
+        "total_scans": system_state["total_scans"],
+        "total_pushes": system_state["total_pushes"],
+        "known_projects": len(known_projects),
+        "last_scan_time": system_state["last_scan_time"],
+        "last_scan_count": system_state["last_scan_count"]
+    }), 200
 
-@app.route("/webhook", methods=["POST"])
-async def telegram_webhook():
-    """处理Telegram的webhook回调"""
-    update_data = request.json
-    update = Update.de_json(update_data, bot)
-    application = context.application if hasattr(context, 'application') else None
 
-    # 手动分发update
-    for handler in command_handlers:
-        check, _ = await handler.check_update(update)
-        if check:
-            await handler.handle_update(update, None)
-            break
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"}), 200
 
-    return jsonify({"status": "ok"})
 
-command_handlers = []
+@app.route("/trigger_scan", methods=["POST"])
+def trigger_scan():
+    """外部触发扫描（UptimeRobot 可用）"""
+    import asyncio
+    asyncio.create_task(do_scan())
+    return jsonify({"status": "scan_triggered"}), 200
 
-def build_app():
-    """构建并返回Telegram Application"""
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # 注册所有命令
-    commands = [
-        ("start", cmd_start),
-        ("menu", cmd_menu),
-        ("status", cmd_status),
-        ("scan", cmd_scan),
-        ("projects", cmd_projects),
-        ("threshold", cmd_threshold),
-        ("help", cmd_help),
-    ]
+# ======================== 启动 ========================
+import asyncio
 
-    global command_handlers
-    for cmd_name, handler_func in commands:
-        handler_obj = CommandHandler(cmd_name, handler_func)
-        application.add_handler(handler_obj)
-        command_handlers.append(handler_obj)
+tg_app = None
 
-    return application
-
-# 全局application实例
-telegram_app = None
-
-@app.before_request
-def init_telegram_app():
-    global telegram_app
-    if telegram_app is None:
-        telegram_app = build_app()
-
-# ======================== 启动入口 ========================
-if __name__ == "__main__":
-    load_state()
-
-    # 启动后台定时扫描
+def run_bot_async():
+    """在后台线程运行 Telegram Bot"""
+    global tg_app
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.create_task(start_background_scheduler())
 
-    # 初始化Telegram bot（使用轮询方式，不需要webhook）
-    telegram_app = build_app()
-    loop.create_task(telegram_app.initialize())
-    loop.create_task(telegram_app.start())
+    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    print(f"[启动] Airdrop Bot 运行在端口 {PORT}")
-    print(f"[配置] 扫描间隔: {SCAN_INTERVAL_MINUTES}分钟, 推送阈值: {THRESHOLD_SCORE}")
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("menu", cmd_menu))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("scan", cmd_scan))
+    tg_app.add_handler(CommandHandler("clear", cmd_clear))
+    tg_app.add_handler(CommandHandler("help", cmd_help))
 
-    # 启动Flask（在后台线程中运行）
-    import threading
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True),
-        daemon=True
-    )
-    flask_thread.start()
+    tg_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    # 主线程运行Telegram轮询
-    loop.run_until_complete(telegram_app.updater.start_polling())
-    loop.run_forever()
+
+@app.before_request
+def before_request():
+    global tg_app
+    if tg_app is None and TELEGRAM_BOT_TOKEN:
+        import threading
+        thread = threading.Thread(target=run_bot_async, daemon=True)
+        thread.start()
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    load_data()
+    print(f"[启动] Airdrop Bot 初始化完成")
+    print(f"[配置] 扫描间隔: {SCAN_INTERVAL_MINUTES}分钟, 推送阈值: {THRESHOLD_SCORE}分")
+    print(f"[数据] 已加载 {len(known_projects)} 个历史记录")
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("[警告] TELEGRAM_BOT_TOKEN 未配置")
+    if not TELEGRAM_CHAT_ID:
+        print("[警告] TELEGRAM_CHAT_ID 未配置")
+
+    app.run(host="0.0.0.0", port=PORT)
